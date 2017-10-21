@@ -2,6 +2,13 @@ require 'digest/sha1'
 require 'mysql2'
 require 'sinatra/base'
 
+require 'mysql2-cs-bind'
+require 'redis'
+require 'oj'
+require 'hiredis'
+require 'zstd-ruby'
+require 'dalli'
+
 class App < Sinatra::Base
   configure do
     set :session_secret, 'tonymoris'

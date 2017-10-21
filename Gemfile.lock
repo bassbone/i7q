@@ -2,13 +2,19 @@ GEM
   remote: https://rubygems.org/
   specs:
     backports (3.9.1)
+    dalli (2.7.6)
+    hiredis (0.6.1)
     multi_json (1.12.2)
     mustermann (1.0.1)
     mysql2 (0.4.9)
+    mysql2-cs-bind (0.0.6)
+      mysql2
+    oj (3.3.8)
     puma (3.10.0)
     rack (2.0.3)
     rack-protection (2.0.0)
       rack
+    redis (4.0.1)
     sinatra (2.0.0)
       mustermann (~> 1.0)
       rack (~> 2.0)
@@ -23,16 +29,23 @@ GEM
       tilt (>= 1.3, < 3)
     stackprof (0.2.10)
     tilt (2.0.8)
+    zstd-ruby (1.3.2.0)
 
 PLATFORMS
   ruby
 
 DEPENDENCIES
+  dalli
+  hiredis
   mysql2
+  mysql2-cs-bind
+  oj
   puma
+  redis
   sinatra
   sinatra-contrib
   stackprof
+  zstd-ruby
 
 BUNDLED WITH
    1.15.4
