@@ -92,8 +92,7 @@ class App < Sinatra::Base
 
   post '/login' do
     name = params[:name]
-    statement = db.prepare('SELECT * FROM user WHERE name = ?')
-    row = statement.execute(name).first
+    row = db.xquery('SELECT id, password, salt FROM user WHERE name = ?', name).first
     if row.nil? || row['password'] != Digest::SHA1.hexdigest(row['salt'] + params[:password])
       return 403
     end
@@ -125,8 +124,7 @@ class App < Sinatra::Base
 
     channel_id = params[:channel_id].to_i
     last_message_id = params[:last_message_id].to_i
-    statement = db.prepare('SELECT * FROM message WHERE id > ? AND channel_id = ? ORDER BY id DESC LIMIT 100')
-    rows = statement.execute(last_message_id, channel_id).to_a
+    rows = db.xquery('SELECT id, user_id, created_at, content FROM message WHERE id > ? AND channel_id = ? ORDER BY id DESC LIMIT 100', last_message_id, channel_id).to_a
     response = []
     rows.each do |row|
       r = {}
@@ -136,7 +134,6 @@ class App < Sinatra::Base
       r['date'] = row['created_at'].strftime("%Y/%m/%d %H:%M:%S")
       r['content'] = row['content']
       response << r
-      statement.close
     end
     response.reverse!
 
@@ -165,9 +162,7 @@ class App < Sinatra::Base
 
     res = []
     channel_ids.each do |channel_id|
-      statement = db.prepare('SELECT * FROM haveread WHERE user_id = ? AND channel_id = ?')
-      row = statement.execute(user_id, channel_id).first
-      statement.close
+      row = db.xquery('SELECT * FROM haveread WHERE user_id = ? AND channel_id = ?', user_id, channel_id).first
       r = {}
       r['channel_id'] = channel_id
       r['unread'] = if row.nil?
@@ -202,25 +197,19 @@ class App < Sinatra::Base
     @page = @page.to_i
 
     n = 20
-    statement = db.prepare('SELECT * FROM message WHERE channel_id = ? ORDER BY id DESC LIMIT ? OFFSET ?')
-    rows = statement.execute(@channel_id, n, (@page - 1) * n).to_a
-    statement.close
+    rows = db.xquery('SELECT * FROM message WHERE channel_id = ? ORDER BY id DESC LIMIT ? OFFSET ?', @channel_id, n, (@page - 1) * n)
     @messages = []
     rows.each do |row|
       r = {}
       r['id'] = row['id']
-      statement = db.prepare('SELECT name, display_name, avatar_icon FROM user WHERE id = ?')
-      r['user'] = statement.execute(row['user_id']).first
+      r['user'] = db.xquery('SELECT name, display_name, avatar_icon FROM user WHERE id = ?', row['user_id']).first
       r['date'] = row['created_at'].strftime("%Y/%m/%d %H:%M:%S")
       r['content'] = row['content']
       @messages << r
-      statement.close
     end
     @messages.reverse!
 
-    statement = db.prepare('SELECT COUNT(*) as cnt FROM message WHERE channel_id = ?')
-    cnt = statement.execute(@channel_id).first['cnt'].to_f
-    statement.close
+    cnt = db.xquery('SELECT COUNT(*) as cnt FROM message WHERE channel_id = ?', @channel_id).first['cnt'].to_f
     @max_page = cnt == 0 ? 1 :(cnt / n).ceil
 
     return 400 if @page > @max_page
@@ -237,9 +226,7 @@ class App < Sinatra::Base
     @channels, = get_channel_list_info
 
     user_name = params[:user_name]
-    statement = db.prepare('SELECT * FROM user WHERE name = ?')
-    @user = statement.execute(user_name).first
-    statement.close
+    @user = db.xquery('SELECT id FROM user WHERE name = ?', user_name).first
 
     if @user.nil?
       return 404
@@ -310,18 +297,12 @@ class App < Sinatra::Base
     end
 
     if !avatar_name.nil? && !avatar_data.nil?
-      statement = db.prepare('INSERT INTO image (name, data) VALUES (?, ?)')
-      statement.execute(avatar_name, avatar_data)
-      statement.close
-      statement = db.prepare('UPDATE user SET avatar_icon = ? WHERE id = ?')
-      statement.execute(avatar_name, user['id'])
-      statement.close
+      db.xquery('INSERT INTO image (name, data) VALUES (?, ?)', avatar_name, avatar_data)
+      db.xquery('UPDATE user SET avatar_icon = ? WHERE id = ?', avatar_name, user['id'])
     end
 
     if !display_name.nil? || !display_name.empty?
-      statement = db.prepare('UPDATE user SET display_name = ? WHERE id = ?')
-      statement.execute(display_name, user['id'])
-      statement.close
+      db.prepare('UPDATE user SET display_name = ? WHERE id = ?', display_name, user['id'])
     end
 
     redirect '/', 303
@@ -329,9 +310,7 @@ class App < Sinatra::Base
 
   get '/icons/:file_name' do
     file_name = params[:file_name]
-    statement = db.prepare('SELECT * FROM image WHERE name = ?')
-    row = statement.execute(file_name).first
-    statement.close
+    row = db.xquery('SELECT data FROM image WHERE name = ?', file_name).first
     ext = file_name.include?('.') ? File.extname(file_name) : ''
     mime = ext2mime(ext)
     if !row.nil? && !mime.empty?
@@ -359,10 +338,7 @@ class App < Sinatra::Base
   end
 
   def db_get_user(user_id)
-    statement = db.prepare('SELECT * FROM user WHERE id = ?')
-    user = statement.execute(user_id).first
-    statement.close
-    user
+    db.xquery('SELECT * FROM user WHERE id = ?', user_id).first
   end
 
   def db_add_message(channel_id, user_id, content)
@@ -379,11 +355,8 @@ class App < Sinatra::Base
   def register(user, password)
     salt = random_string(20)
     pass_digest = Digest::SHA1.hexdigest(salt + password)
-    statement = db.prepare('INSERT INTO user (name, salt, password, display_name, avatar_icon, created_at) VALUES (?, ?, ?, ?, ?, NOW())')
-    statement.execute(user, salt, pass_digest, user, 'default.png')
-    row = db.query('SELECT LAST_INSERT_ID() AS last_insert_id').first
-    statement.close
-    row['last_insert_id']
+    db.xquery('INSERT INTO user (name, salt, password, display_name, avatar_icon, created_at) VALUES (?, ?, ?, ?, ?, NOW())', user, salt, pass_digest, user, 'default.png')
+    db.query('SELECT LAST_INSERT_ID() AS last_insert_id').first['last_insert_id']
   end
 
   def get_channel_list_info(focus_channel_id = nil)
