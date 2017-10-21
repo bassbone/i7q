@@ -8,8 +8,11 @@ require 'oj'
 require 'hiredis'
 require 'zstd-ruby'
 require 'dalli'
+require 'rack/cache'
 
 class App < Sinatra::Base
+  use Rack::Cache
+
   configure do
     set :session_secret, 'tonymoris'
     set :public_folder, File.expand_path('../../public', __FILE__)
@@ -45,7 +48,7 @@ class App < Sinatra::Base
     db.query("DELETE FROM image WHERE id > 1001")
     db.query("DELETE FROM channel WHERE id > 10")
     db.query("DELETE FROM message WHERE id > 10000")
-    db.query("DELETE FROM haveread")
+    db.query("TRUNCATE haveread")
     redis.flushall
     204
   end
@@ -93,11 +96,11 @@ class App < Sinatra::Base
 
   post '/login' do
     name = params[:name]
-    row = db.xquery('SELECT id, password, salt FROM user WHERE name = ?', name).first
-    if row.nil? || row[:password] != Digest::SHA1.hexdigest(row[:salt] + params[:password])
+    user = db.xquery('SELECT id, password, salt FROM user WHERE name = ?', name).first
+    if user.nil? || user[:password] != Digest::SHA1.hexdigest(user[:salt] + params[:password])
       return 403
     end
-    session[:user_id] = row[:id]
+    session[:user_id] = user[:id]
     redirect '/', 303
   end
 
@@ -125,12 +128,12 @@ class App < Sinatra::Base
 
     channel_id = params[:channel_id].to_i
     last_message_id = params[:last_message_id].to_i
-    rows = db.xquery('SELECT id, user_id, created_at, content FROM message WHERE id > ? AND channel_id = ? ORDER BY id DESC LIMIT 100', last_message_id, channel_id)
+    rows = get_messages_1(last_message_id, channel_id)
     response = []
     rows.each do |row|
       r = {}
       r[:id] = row[:id]
-      r[:user] = db.xquery('SELECT name, display_name, avatar_icon FROM user WHERE id = ?', row[:user_id]).first
+      r[:user] = get_user(row[:user_id])
       r[:date] = row[:created_at].strftime("%Y/%m/%d %H:%M:%S")
       r[:content] = row[:content]
       response << r
@@ -151,7 +154,7 @@ class App < Sinatra::Base
       return 403
     end
 
-    #sleep 1.0
+    sleep 0.3
 
     channels = get_channels()
 
@@ -162,13 +165,10 @@ class App < Sinatra::Base
       r = {}
       r[:channel_id] = channel_id
       r[:unread] = if row.nil?
-        statement = db.prepare('SELECT COUNT(*) as cnt FROM message WHERE channel_id = ?')
-        statement.execute(channel_id).first[:cnt]
+        db.xquery('SELECT COUNT(id) as cnt FROM message WHERE channel_id = ?', channel_id).first[:cnt]
       else
-        statement = db.prepare('SELECT COUNT(*) as cnt FROM message WHERE channel_id = ? AND ? < id')
-        statement.execute(channel_id, row[:message_id]).first[:cnt]
+        db.xquery('SELECT COUNT(id) as cnt FROM message WHERE channel_id = ? AND ? < id', channel_id, row[:message_id]).first[:cnt]
       end
-      statement.close
       res << r
     end
 
@@ -193,12 +193,12 @@ class App < Sinatra::Base
     @page = @page.to_i
 
     n = 20
-    rows = db.xquery("SELECT * FROM message WHERE channel_id = ? ORDER BY id DESC LIMIT #{n} OFFSET #{(@page - 1) * n}", @channel_id)
+    rows = db.xquery("SELECT id, user_id, created_at, content FROM message WHERE channel_id = ? ORDER BY id DESC LIMIT #{n} OFFSET #{(@page - 1) * n}", @channel_id)
     @messages = []
     rows.each do |row|
       r = {}
       r[:id] = row[:id]
-      r[:user] = db.xquery('SELECT name, display_name, avatar_icon FROM user WHERE id = ?', row[:user_id]).first
+      r[:user] = get_user(row[:user_id]) 
       r[:date] = row[:created_at].strftime("%Y/%m/%d %H:%M:%S")
       r[:content] = row[:content]
       @messages << r
@@ -222,7 +222,7 @@ class App < Sinatra::Base
     @channels, = get_channel_list_info
 
     user_name = params[:user_name]
-    @user = db.xquery('SELECT id, name, display_name, avatar_icon FROM user WHERE name = ?', user_name).first
+    @user = get_user_by_name(user_name)
 
     if @user.nil?
       return 404
@@ -251,10 +251,9 @@ class App < Sinatra::Base
     if name.nil? || description.nil?
       return 400
     end
-    statement = db.prepare('INSERT INTO channel (name, description, updated_at, created_at) VALUES (?, ?, NOW(), NOW())')
-    statement.execute(name, description)
-    channel_id = db.last_id
-    statement.close
+    exe = db.xquery('INSERT INTO channel (name, description, updated_at, created_at) VALUES (?, ?, NOW(), NOW())', name, description)
+    channel_id = db.query('SELECT LAST_INSERT_ID() AS last_insert_id').first[:last_insert_id]
+    redis.del 'channels'
     redirect "/channel/#{channel_id}", 303
   end
 
@@ -301,22 +300,71 @@ class App < Sinatra::Base
       db.xquery('UPDATE user SET display_name = ? WHERE id = ?', display_name, user[:id])
     end
 
+    tmp_user = get_user(user[:id])
+    redis.del 'user_' + user[:id].to_s
+    redis.del 'user_by_name_' + tmp_user[:name]
     redirect '/', 303
   end
 
   get '/icons/:file_name' do
+    cache_control :public, :max_age => 3600
     file_name = params[:file_name]
-    row = db.xquery('SELECT data FROM image WHERE name = ?', file_name).first
+    data = get_image_data(file_name)
     ext = file_name.include?('.') ? File.extname(file_name) : ''
     mime = ext2mime(ext)
-    if !row.nil? && !mime.empty?
+    if !data.nil? && !mime.empty?
       content_type mime
-      return row[:data]
+      return data
     end
     404
   end
 
   private
+
+  def get_messages_1(last_message_id, channel_id)
+    db.xquery('SELECT id, user_id, created_at, content FROM message WHERE id > ? AND channel_id = ? ORDER BY id DESC LIMIT 100', last_message_id, channel_id)
+  end
+
+  def get_user(id)
+    key = 'user_' + id.to_s
+    tmp = redis.get(key)
+    if tmp then
+      return Oj.load(tmp, :mode => :compat, :symbol_keys => true)
+    else
+      user = db.xquery('SELECT name, display_name, avatar_icon FROM user WHERE id = ?', id).first
+      user_json = Oj.dump(user, :mode => :compat, :symbol_keys => true)
+      redis.set key, user_json
+      return user
+    end
+  end
+
+  def get_user_by_name(name)
+    key = 'user_by_name_' + name
+    tmp = redis.get(key)
+    if tmp then
+      return Oj.load(tmp, :mode => :compat, :symbol_keys => true)
+    else
+      user = db.xquery('SELECT id, name, display_name, avatar_icon FROM user WHERE name = ?', name).first
+      return nil unless user
+      p 'sss' + user[:id].to_s
+      user_json = Oj.dump(user, :mode => :compat, :symbol_keys => true)
+      p user_json
+      redis.set key, user_json
+      return user
+    end
+  end
+
+  def get_image_data(name)
+    key = 'image_' + name
+    tmp = redis.get(key)
+    if tmp then
+      return tmp
+    else
+      data = db.xquery('SELECT data FROM image WHERE name = ?', name).first[:data]
+      redis.set key, data
+      return data
+    end
+  end
 
   def get_channels()
     key = 'channels'
@@ -358,6 +406,14 @@ class App < Sinatra::Base
     client = Redis.new(:host => "192.168.101.3", :port => 6379, :driver => :hiredis, :tcp_keepalive => 60)
     Thread.current[:isucon_redis] = client
     client
+  end
+
+  def compress(data)
+    Zstd.compress(data)
+  end
+
+  def decompress(data)
+    Zstd.decompress(data)
   end
 
   def db_get_user(user_id)

@@ -12,3 +12,5 @@ gem 'oj'
 gem 'hiredis'
 gem 'zstd-ruby'
 gem 'dalli'
+gem 'rack-cache'
+
