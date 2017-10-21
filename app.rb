@@ -46,6 +46,7 @@ class App < Sinatra::Base
     db.query("DELETE FROM channel WHERE id > 10")
     db.query("DELETE FROM message WHERE id > 10000")
     db.query("DELETE FROM haveread")
+    redis.flushall
     204
   end
 
@@ -93,10 +94,10 @@ class App < Sinatra::Base
   post '/login' do
     name = params[:name]
     row = db.xquery('SELECT id, password, salt FROM user WHERE name = ?', name).first
-    if row.nil? || row['password'] != Digest::SHA1.hexdigest(row['salt'] + params[:password])
+    if row.nil? || row[:password] != Digest::SHA1.hexdigest(row[:salt] + params[:password])
       return 403
     end
-    session[:user_id] = row['id']
+    session[:user_id] = row[:id]
     redirect '/', 303
   end
 
@@ -124,26 +125,21 @@ class App < Sinatra::Base
 
     channel_id = params[:channel_id].to_i
     last_message_id = params[:last_message_id].to_i
-    rows = db.xquery('SELECT id, user_id, created_at, content FROM message WHERE id > ? AND channel_id = ? ORDER BY id DESC LIMIT 100', last_message_id, channel_id).to_a
+    rows = db.xquery('SELECT id, user_id, created_at, content FROM message WHERE id > ? AND channel_id = ? ORDER BY id DESC LIMIT 100', last_message_id, channel_id)
     response = []
     rows.each do |row|
       r = {}
-      r['id'] = row['id']
-      statement = db.prepare('SELECT name, display_name, avatar_icon FROM user WHERE id = ?')
-      r['user'] = statement.execute(row['user_id']).first
-      r['date'] = row['created_at'].strftime("%Y/%m/%d %H:%M:%S")
-      r['content'] = row['content']
+      r[:id] = row[:id]
+      r[:user] = db.xquery('SELECT name, display_name, avatar_icon FROM user WHERE id = ?', row[:user_id]).first
+      r[:date] = row[:created_at].strftime("%Y/%m/%d %H:%M:%S")
+      r[:content] = row[:content]
       response << r
     end
     response.reverse!
 
-    max_message_id = rows.empty? ? 0 : rows.map { |row| row['id'] }.max
-    statement = db.prepare([
-      'INSERT INTO haveread (user_id, channel_id, message_id, updated_at, created_at) ',
-      'VALUES (?, ?, ?, NOW(), NOW()) ',
-      'ON DUPLICATE KEY UPDATE message_id = ?, updated_at = NOW()',
-    ].join)
-    statement.execute(user_id, channel_id, max_message_id, max_message_id)
+    max_message_id = rows.nil? ? 0 : rows.map { |row| row[:id] }.max
+    p max_message_id
+    db.xquery('INSERT INTO haveread (user_id, channel_id, message_id, updated_at, created_at) VALUES (?, ?, ?, NOW(), NOW()) ON DUPLICATE KEY UPDATE message_id = ?, updated_at = NOW()', user_id, channel_id, max_message_id, max_message_id)
 
     content_type :json
     response.to_json
@@ -155,22 +151,22 @@ class App < Sinatra::Base
       return 403
     end
 
-    sleep 1.0
+    #sleep 1.0
 
-    rows = db.query('SELECT id FROM channel').to_a
-    channel_ids = rows.map { |row| row['id'] }
+    channels = get_channels()
 
     res = []
-    channel_ids.each do |channel_id|
+    channels.each do |channel|
+      channel_id = channel[:id]
       row = db.xquery('SELECT * FROM haveread WHERE user_id = ? AND channel_id = ?', user_id, channel_id).first
       r = {}
-      r['channel_id'] = channel_id
-      r['unread'] = if row.nil?
+      r[:channel_id] = channel_id
+      r[:unread] = if row.nil?
         statement = db.prepare('SELECT COUNT(*) as cnt FROM message WHERE channel_id = ?')
-        statement.execute(channel_id).first['cnt']
+        statement.execute(channel_id).first[:cnt]
       else
         statement = db.prepare('SELECT COUNT(*) as cnt FROM message WHERE channel_id = ? AND ? < id')
-        statement.execute(channel_id, row['message_id']).first['cnt']
+        statement.execute(channel_id, row[:message_id]).first[:cnt]
       end
       statement.close
       res << r
@@ -197,19 +193,19 @@ class App < Sinatra::Base
     @page = @page.to_i
 
     n = 20
-    rows = db.xquery('SELECT * FROM message WHERE channel_id = ? ORDER BY id DESC LIMIT ? OFFSET ?', @channel_id, n, (@page - 1) * n)
+    rows = db.xquery("SELECT * FROM message WHERE channel_id = ? ORDER BY id DESC LIMIT #{n} OFFSET #{(@page - 1) * n}", @channel_id)
     @messages = []
     rows.each do |row|
       r = {}
-      r['id'] = row['id']
-      r['user'] = db.xquery('SELECT name, display_name, avatar_icon FROM user WHERE id = ?', row['user_id']).first
-      r['date'] = row['created_at'].strftime("%Y/%m/%d %H:%M:%S")
-      r['content'] = row['content']
+      r[:id] = row[:id]
+      r[:user] = db.xquery('SELECT name, display_name, avatar_icon FROM user WHERE id = ?', row[:user_id]).first
+      r[:date] = row[:created_at].strftime("%Y/%m/%d %H:%M:%S")
+      r[:content] = row[:content]
       @messages << r
     end
     @messages.reverse!
 
-    cnt = db.xquery('SELECT COUNT(*) as cnt FROM message WHERE channel_id = ?', @channel_id).first['cnt'].to_f
+    cnt = db.xquery('SELECT COUNT(*) as cnt FROM message WHERE channel_id = ?', @channel_id).first[:cnt].to_f
     @max_page = cnt == 0 ? 1 :(cnt / n).ceil
 
     return 400 if @page > @max_page
@@ -226,13 +222,13 @@ class App < Sinatra::Base
     @channels, = get_channel_list_info
 
     user_name = params[:user_name]
-    @user = db.xquery('SELECT id FROM user WHERE name = ?', user_name).first
+    @user = db.xquery('SELECT id, name, display_name, avatar_icon FROM user WHERE name = ?', user_name).first
 
     if @user.nil?
       return 404
     end
 
-    @self_profile = user['id'] == @user['id']
+    @self_profile = user[:id] == @user[:id]
     erb :profile
   end
   
@@ -298,11 +294,11 @@ class App < Sinatra::Base
 
     if !avatar_name.nil? && !avatar_data.nil?
       db.xquery('INSERT INTO image (name, data) VALUES (?, ?)', avatar_name, avatar_data)
-      db.xquery('UPDATE user SET avatar_icon = ? WHERE id = ?', avatar_name, user['id'])
+      db.xquery('UPDATE user SET avatar_icon = ? WHERE id = ?', avatar_name, user[:id])
     end
 
     if !display_name.nil? || !display_name.empty?
-      db.prepare('UPDATE user SET display_name = ? WHERE id = ?', display_name, user['id'])
+      db.xquery('UPDATE user SET display_name = ? WHERE id = ?', display_name, user[:id])
     end
 
     redirect '/', 303
@@ -315,26 +311,53 @@ class App < Sinatra::Base
     mime = ext2mime(ext)
     if !row.nil? && !mime.empty?
       content_type mime
-      return row['data']
+      return row[:data]
     end
     404
   end
 
   private
 
-  def db
-    return @db_client if defined?(@db_client)
+  def get_channels()
+    key = 'channels'
+    tmp = redis.get(key)
+    if tmp then
+      return Oj.load(tmp, :mode => :compat, :symbol_keys => true)
+    else
+      ids = db.query('SELECT id FROM channel')
+      rows = Array.new
+      ids.each do |id|
+          rows << id
+      end
+      rows_json = Oj.dump(rows, :mode => :compat, :symbol_keys => true)
+      redis.set key, rows_json
+      return rows
+    end
+  end
 
-    @db_client = Mysql2::Client.new(
+  def db
+    return Thread.current[:isucon_db] if Thread.current[:isucon_db]
+    client = Mysql2::Client.new(
       host: ENV.fetch('ISUBATA_DB_HOST') { 'localhost' },
       port: ENV.fetch('ISUBATA_DB_PORT') { '3306' },
       username: ENV.fetch('ISUBATA_DB_USER') { 'root' },
       password: ENV.fetch('ISUBATA_DB_PASSWORD') { '' },
       database: 'isubata',
-      encoding: 'utf8mb4'
+      encoding: 'utf8mb4',
+      reconnect: true,
+      cache_rows: true,
+      init_command: "SET SESSION sql_mode='TRADITIONAL,NO_AUTO_VALUE_ON_ZERO,ONLY_FULL_GROUP_BY'"
     )
-    @db_client.query('SET SESSION sql_mode=\'TRADITIONAL,NO_AUTO_VALUE_ON_ZERO,ONLY_FULL_GROUP_BY\'')
-    @db_client
+    client.query_options.merge!(symbolize_keys: true)
+    Thread.current[:isucon_db] = client
+    client
+  end
+
+  def redis
+    return Thread.current[:isucon_redis] if Thread.current[:isucon_redis]
+    client = Redis.new(:host => "192.168.101.3", :port => 6379, :driver => :hiredis, :tcp_keepalive => 60)
+    Thread.current[:isucon_redis] = client
+    client
   end
 
   def db_get_user(user_id)
@@ -356,15 +379,15 @@ class App < Sinatra::Base
     salt = random_string(20)
     pass_digest = Digest::SHA1.hexdigest(salt + password)
     db.xquery('INSERT INTO user (name, salt, password, display_name, avatar_icon, created_at) VALUES (?, ?, ?, ?, ?, NOW())', user, salt, pass_digest, user, 'default.png')
-    db.query('SELECT LAST_INSERT_ID() AS last_insert_id').first['last_insert_id']
+    db.query('SELECT LAST_INSERT_ID() AS last_insert_id').first[:last_insert_id]
   end
 
   def get_channel_list_info(focus_channel_id = nil)
     channels = db.query('SELECT * FROM channel ORDER BY id').to_a
     description = ''
     channels.each do |channel|
-      if channel['id'] == focus_channel_id
-        description = channel['description']
+      if channel[:id] == focus_channel_id
+        description = channel[:description]
         break
       end
     end
